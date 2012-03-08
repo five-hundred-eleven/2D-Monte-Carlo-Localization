@@ -32,10 +32,11 @@ import angles
 import threading
 
 PAR_COUNT = 1200
-NOISE = PAR_COUNT*.10 
+NOISE = int(PAR_COUNT*.10)
 cmd_vel = None
 
 dt = 0.1
+control = (0.0, 0.0)
 
 # State
 parset   = [mcl_tools.random_particle() for ii in range(PAR_COUNT)]
@@ -47,23 +48,24 @@ centroid = (0, 0, 0)
 var_threshold = 0.70
 threshold_cnt = 0
 mode = 'wander'
-
-laserscan = np.array([0.0 for i in xrange(5)])
-
-global gaussian_base
 gaussian_base = 1./(sqrt(2*pi)*0.5)
 
+Wait, Found_Goal = False, False
+
+# Gaussian probability
 def gaussian_p(s_reading, p_reading):
     global gaussian_base
     mu = p_reading - s_reading
-    exp = -(mu*mu) 
+    exp = -(mu*mu)/0.5 
     return gaussian_base * e**exp 
 
+# Particle weight assignment
 def particle_weight(particle, scan):
     global range_ts
     return sum([gaussian_p(scan[i], mcl_tools.map_range(particle, range_ts[i]))
                 for i in xrange(5)])
 
+# Low variance sampling algorithm from the book.
 def low_var_sample(ps, sample_count, ws):
     p_prime = []
     sc_inverse = 1./len(ps)
@@ -103,23 +105,28 @@ def particle_filter(ps, control, scan):
                for p in ps]
     '''
     
-    weights = np.array([particle_weight(p, scan) for p in ps])
+    new_weights = np.array([particle_weight(p, scan) for p in ps])
+    weights *= new_weights
     weights /= weights.sum()
     wvar = 1./sum([w*w for w in weights])
-    if wvar < random.gauss(PAR_COUNT*.80, 50):
-        print 'resampled', wvar
+    if wvar < random.gauss(PAR_COUNT*.81, 60):
         ps = mcl_tools.random_sample(ps, PAR_COUNT - NOISE, weights) + [mcl_tools.random_particle() for ii in xrange(NOISE)]
+        weights = [1.0 for ii in xrange(PAR_COUNT)]
     else:
-        print 'no resample', wvar
+        pass
 
     return [motion_update(p) for p in ps] 
 
 
 def got_scan(msg):
+    global Wait
+    global Found_Goal
+    if Wait or Found_Goal:
+        return
+
     global parset
     global control
     global centroid
-    global laserscan
 
     laserscan = msg.ranges
 
@@ -165,15 +172,12 @@ def pathfind(goal, current):
         # are we at the goal??
         dy = y - gy 
         if abs(dy) < 0.3:
-            print ""
-            print "Great success!"
-            print ""
-            sys.exit(1)
-            control = (0.0, 0.0)
+            # We're there! No movement signals success.
+            return (0.0, 0.0)
 
         # are we facing the right direction?
         dt = set_heading(3*pi/2 - dx)
-        v = 1.5 if abs(dt) < pi/8 else 0.0
+        v = 0.9 if abs(dt) < pi/8 else 0.0
         control = (v, dt/3)
 
     # if not, are we at the right place on the y-axis?
@@ -193,8 +197,16 @@ def pathfind(goal, current):
 
     return control
 
-control = (0.0, 0.0)
 def controller(msg):
+    global Wait
+    global Found_Goal
+    if Wait or Found_Goal:
+        control = (0.0, 0.0)
+        cmd = Twist()
+        (cmd.linear.x, cmd.angular.z) = control
+        cmd_vel.publish(cmd)
+        return
+
     global cmd_vel
     global mode
     global centroid
@@ -204,22 +216,32 @@ def controller(msg):
     x, y, t = centroid 
     laserscan = msg.ranges
 
+    # If mode is wander, just avoid hitting the walls. 
     if mode == 'wander' or abs(x-19.5) > 0.4:
+        # Is there a wall in front of us? If so, slow down and spin.
         if min(laserscan[1:4]) < 1.9:
             t = ((laserscan[4]+laserscan[3]) - (laserscan[1]+laserscan[0]))
             if abs(t) < 1.00: 
-                t = copysign(0.3, t) 
+                t = copysign(0.4, t) 
             else:
-                t *= 0.15
+                t *= 0.20
             control = ((min(laserscan) - 1.0)*0.6, t) 
+        # Otherwise, move forward and try to align with the nearest wall.
         else:
             l, d, t = (0, 1, 1) if laserscan[1] < laserscan[3] else (4, 3, -1)
             w = sqrt(l**2 + d**2 - 2*l*d*cos(pi/4)) 
             t = (l-w)*t if l > 0.5 else (w-l)*t
-            control = (1.0, t*.5)
+            control = (1.5, t*.5)
 
+    # If mode is goal, try to get to the goal using pathfind()
     else: # mode == 'goal'
-        v, t = pathfind((19.5, 1.0), centroid)
+        v, t = pathfind((19.5, 1.5), centroid)
+        if (v, t) == (0.0, 0.0):
+            print ''
+            print 'Great Success!'
+            print ''
+            Found_Goal = True
+            return
         if min(laserscan[1:4]) < 0.75: 
             t += (laserscan[3] - laserscan[1])*0.35
         control = (v, t)
@@ -232,6 +254,8 @@ def controller(msg):
 
 
 
+def dist(p0, p1):
+    return sqrt((p0[0]-p1[0])**2 + (p0[1]-p1[1])**2)
 
 def clustering():
     global parset
@@ -240,34 +264,65 @@ def clustering():
     global threshold_cnt
     global mode
     global control
+    global Wait
 
     def motion_update(p):
-        v, w = control
-
+        v, w = control 
         v_dt = v*dt
         w_dt = w*dt
         x, y, t = p
         return (x + v_dt*cos(t),
                 y + v_dt*sin(t),
-                angles.r2r(t+dt))
-
+                angles.r2r(t))
+    
+    # Clustering algorithm: DBSCAN
+    # Not important for the primary purpose of this assignment.
     while True:
         #ps = np.array([(p[0], p[1]) for p in parset])
         #whitened = whiten(ps)
-        c, var = kmeans(np.array(parset), 1) 
-        x, y, t = c[0]
-        centroid = (x, y, angles.r2r(t))
-        #print centroid, var, mode
 
-        if var < var_threshold:
-            mode = 'goal'
-            threshold_cnt += 1
-        else:
-            mode = 'wander'
-            threshold_cnt = 0
+        Wait = True
 
-        rospy.sleep(0.08)
-        for i in xrange(4):
+        ps = parset
+        ps.sort()
+        visited = set()
+        clusters = {}
+        cluster_cnt = 0
+        for i in xrange(PAR_COUNT):
+            if i in visited: 
+                continue
+            frontier = [i]
+            cluster_cnt += 1
+            clusters[cluster_cnt] = []
+            while len(frontier):
+                ci = frontier.pop()
+                current = ps[ci]
+                clusters[cluster_cnt].append(current)
+                end_i = ci + 100
+                if end_i > PAR_COUNT: 
+                    end_i = PAR_COUNT
+                region_query = [(dist(current, ps[j]), j) for j in xrange(ci, end_i) 
+                                if j not in visited]
+                region_query.sort(lambda a, b: cmp(a[0], b[0]))
+                for d, qi in region_query: 
+                    if d > 0.2:
+                        break
+                    else:
+                        visited.add(qi)
+                        frontier.append(qi)
+
+        sz, best_cluster = max([(len(c), c) for c in clusters.values()])
+        centroids, var = kmeans(np.array([(x, y) for x, y, t in best_cluster]), 1)
+        x, y = centroids[0] 
+        centroid = (x, y, best_cluster[random.randint(0, sz-1)][2])
+
+        mode = 'wander' if sz < 800 else 'goal'
+        print mode, centroid
+
+        Wait = False
+
+        rospy.sleep(0.1)
+        for i in xrange(20):
             centroid = motion_update(centroid)
             rospy.sleep(0.1)
 
@@ -282,11 +337,11 @@ if __name__ == '__main__':
     except IOError:
         pass
 
+    cmd_vel = rospy.Publisher('/robot/cmd_vel', Twist)
     rospy.Subscriber('/robot/base_scan', LaserScan, callback=got_scan,
             queue_size = 10, tcp_nodelay = True)
     rospy.Subscriber('/robot/base_scan', LaserScan, callback=controller,
             queue_size = 10, tcp_nodelay = True)
-    cmd_vel = rospy.Publisher('/robot/cmd_vel', Twist)
 
     clustering_thread = threading.Thread(target=clustering)
     clustering_thread.start()
